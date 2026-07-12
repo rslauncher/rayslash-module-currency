@@ -1,0 +1,128 @@
+#[allow(warnings)]
+mod bindings;
+
+use bindings::exports::rayslash::module::provider::Guest;
+use bindings::rayslash::module::{
+    host,
+    types::{Action, Icon, ModuleError, QueryContext, QueryResponse, ResultItem},
+};
+use serde::Deserialize;
+
+struct Component;
+
+#[derive(Deserialize)]
+struct Rate {
+    rate: f64,
+}
+
+impl Guest for Component {
+    fn query(context: QueryContext) -> Result<QueryResponse, ModuleError> {
+        let Some((amount, base, quote)) = parse(&context.query) else {
+            return Ok(QueryResponse {
+                results: Vec::new(),
+                exclusive: false,
+            });
+        };
+        let result = if base == quote {
+            Ok(amount)
+        } else {
+            rate(&base, &quote).map(|rate| amount * rate)
+        };
+        let (title, action) = match result {
+            Ok(value) => {
+                let text = format!("{} {quote}", format_number(value));
+                (text.clone(), Action::CopyText(text))
+            }
+            Err(error) => (error.clone(), Action::ShowMessage(error)),
+        };
+        Ok(QueryResponse {
+            results: vec![ResultItem {
+                id: format!("currency:{}:{base}:{quote}", format_number(amount)),
+                title,
+                subtitle: format!(
+                    "Convert {} {base} to {quote} with Frankfurter",
+                    format_number(amount)
+                ),
+                icon: Icon::Text("$".into()),
+                score: None,
+                action,
+            }],
+            exclusive: true,
+        })
+    }
+}
+
+fn parse(input: &str) -> Option<(f64, String, String)> {
+    let words = input.split_whitespace().collect::<Vec<_>>();
+    if words.len() != 4 || !words[2].eq_ignore_ascii_case("to") {
+        return None;
+    }
+    let amount = words[0].replace(',', "").parse::<f64>().ok()?;
+    let base = code(words[1])?;
+    let quote = code(words[3])?;
+    amount.is_finite().then_some((amount, base, quote))
+}
+fn code(value: &str) -> Option<String> {
+    let value = value.to_ascii_uppercase();
+    (value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())).then_some(value)
+}
+fn rate(base: &str, quote: &str) -> Result<f64, String> {
+    let key = format!("rate-{base}-{quote}.json");
+    if let Ok(Some(bytes)) = host::cache_get(&key)
+        && let Ok(rate) = serde_json::from_slice::<Rate>(&bytes)
+    {
+        return valid_rate(rate.rate);
+    }
+    let request = host::HttpRequest {
+        method: "GET".into(),
+        url: format!("https://api.frankfurter.app/v2/rate/{base}/{quote}"),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    let response =
+        host::request(&request).map_err(|error| format!("Currency rate unavailable: {error:?}"))?;
+    if response.status != 200 {
+        return Err(format!(
+            "Currency service returned HTTP {}.",
+            response.status
+        ));
+    }
+    let parsed: Rate = serde_json::from_slice(&response.body)
+        .map_err(|_| "Currency service returned invalid data.".to_owned())?;
+    let rate = valid_rate(parsed.rate)?;
+    let _ = host::cache_put(&key, &response.body);
+    Ok(rate)
+}
+fn valid_rate(rate: f64) -> Result<f64, String> {
+    (rate.is_finite() && rate > 0.0)
+        .then_some(rate)
+        .ok_or_else(|| "Currency service returned an invalid rate.".into())
+}
+fn format_number(value: f64) -> String {
+    if (value - value.round()).abs() < 1e-10 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.6}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    }
+}
+
+bindings::export!(Component with_types_in bindings);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parses_currency_query() {
+        assert_eq!(
+            parse("25 brl to usd"),
+            Some((25.0, "BRL".into(), "USD".into()))
+        );
+    }
+    #[test]
+    fn rejects_non_codes() {
+        assert!(parse("25 dollars to usd").is_none());
+    }
+}

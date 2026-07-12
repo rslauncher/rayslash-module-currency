@@ -1,0 +1,23 @@
+id = "rayslash.currency"
+name = "Currency"
+description = "Convert currencies with cached live rates."
+author = "rayslash"
+version = "1.0.0"
+api_version = "^1.0"
+license = "MIT"
+source = "https://github.com/rslauncher/rayslash-module-currency"
+icon = "icon.svg"
+kind = "wasm"
+
+[permissions]
+network = ["https://api.frankfurter.app"]
+cache = true
+clipboard = false
+notifications = false
+commands = false
+
+[[providers]]
+id = "currency"
+name = "Currency"
+description = "Convert currencies with cached live rates."
+triggers = []
