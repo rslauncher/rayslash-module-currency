@@ -2,7 +2,7 @@ id = "rayslash.currency"
 name = "Currency"
 description = "Convert currencies with cached live rates."
 author = "rayslash"
-version = "1.0.1"
+version = "1.0.2"
 api_version = "^1.0"
 license = "MIT"
 source = "https://github.com/rslauncher/rayslash-module-currency"
@@ -10,7 +10,7 @@ icon = "icon.svg"
 kind = "wasm"
 
 [permissions]
-network = ["https://api.frankfurter.app"]
+network = ["https://api.frankfurter.dev"]
 cache = true
 clipboard = false
 notifications = false

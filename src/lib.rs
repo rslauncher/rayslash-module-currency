@@ -6,13 +6,20 @@ use bindings::rayslash::module::{
     host,
     types::{Action, Icon, ModuleError, QueryContext, QueryResponse, ResultItem},
 };
-use serde::Deserialize;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 
 struct Component;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Rate {
     rate: f64,
+}
+
+#[derive(Deserialize)]
+struct LatestRates {
+    rates: BTreeMap<String, f64>,
 }
 
 impl Guest for Component {
@@ -75,7 +82,7 @@ fn rate(base: &str, quote: &str) -> Result<f64, String> {
     }
     let request = host::HttpRequest {
         method: "GET".into(),
-        url: format!("https://api.frankfurter.app/v2/rate/{base}/{quote}"),
+        url: format!("https://api.frankfurter.dev/v1/latest?base={base}&symbols={quote}"),
         headers: Vec::new(),
         body: Vec::new(),
     };
@@ -87,10 +94,17 @@ fn rate(base: &str, quote: &str) -> Result<f64, String> {
             response.status
         ));
     }
-    let parsed: Rate = serde_json::from_slice(&response.body)
+    let parsed: LatestRates = serde_json::from_slice(&response.body)
         .map_err(|_| "Currency service returned invalid data.".to_owned())?;
-    let rate = valid_rate(parsed.rate)?;
-    let _ = host::cache_put(&key, &response.body);
+    let rate = parsed
+        .rates
+        .get(quote)
+        .copied()
+        .ok_or_else(|| "Currency service did not return the requested rate.".to_owned())
+        .and_then(valid_rate)?;
+    if let Ok(bytes) = serde_json::to_vec(&Rate { rate }) {
+        let _ = host::cache_put(&key, &bytes);
+    }
     Ok(rate)
 }
 fn valid_rate(rate: f64) -> Result<f64, String> {
@@ -124,5 +138,13 @@ mod tests {
     #[test]
     fn rejects_non_codes() {
         assert!(parse("25 dollars to usd").is_none());
+    }
+    #[test]
+    fn parses_current_frankfurter_response() {
+        let response: LatestRates = serde_json::from_str(
+            r#"{"amount":1.0,"base":"BRL","date":"2026-07-10","rates":{"USD":0.19537}}"#,
+        )
+        .unwrap();
+        assert_eq!(response.rates.get("USD"), Some(&0.19537));
     }
 }
