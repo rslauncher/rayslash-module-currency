@@ -50,7 +50,7 @@ impl Guest for Component {
                     "Convert {} {base} to {quote} with Frankfurter",
                     format_number(amount)
                 ),
-                icon: Icon::Text("$".into()),
+                icon: Icon::PackagePath("icon.svg".into()),
                 score: None,
                 action,
             }],
