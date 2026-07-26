@@ -10,11 +10,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+const RATE_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
+
 struct Component;
 
-#[derive(Deserialize, Serialize)]
-struct Rate {
-    rate: f64,
+#[derive(Clone, Deserialize, Serialize)]
+struct CachedRates {
+    rates: BTreeMap<String, f64>,
+    #[serde(default)]
+    fetched_at: u64,
 }
 
 #[derive(Deserialize)]
@@ -90,15 +94,49 @@ fn code(value: &str) -> Option<String> {
     (value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())).then_some(value)
 }
 fn rate(base: &str, quote: &str) -> Result<f64, String> {
-    let key = format!("rate-{base}-{quote}.json");
-    if let Ok(Some(bytes)) = host::cache_get(&key)
-        && let Ok(rate) = serde_json::from_slice::<Rate>(&bytes)
+    let key = format!("rates-v2-{base}.json");
+    let now = host::unix_time();
+    let cached = host::cache_get(&key)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<CachedRates>(&bytes).ok());
+    if let Some(rates) = cached.as_ref()
+        && cache_is_fresh(rates.fetched_at, now)
+        && let Some(rate) = rates.rates.get(quote).copied()
     {
-        return valid_rate(rate.rate);
+        return valid_rate(rate);
     }
+    match request_rates(base) {
+        Ok(rates) => {
+            let rate = rates
+                .get(quote)
+                .copied()
+                .ok_or_else(|| "Currency service did not return the requested rate.".to_owned())
+                .and_then(valid_rate)?;
+            if let Ok(bytes) = serde_json::to_vec(&CachedRates {
+                rates,
+                fetched_at: now,
+            }) {
+                let _ = host::cache_put(&key, &bytes);
+            }
+            Ok(rate)
+        }
+        Err(error) => cached
+            .and_then(|rates| rates.rates.get(quote).copied())
+            .map(valid_rate)
+            .transpose()
+            .and_then(|rate| rate.ok_or(error)),
+    }
+}
+
+fn cache_is_fresh(fetched_at: u64, now: u64) -> bool {
+    fetched_at != 0 && now.saturating_sub(fetched_at) <= RATE_CACHE_TTL_SECONDS
+}
+
+fn request_rates(base: &str) -> Result<BTreeMap<String, f64>, String> {
     let request = host::HttpRequest {
         method: "GET".into(),
-        url: format!("https://api.frankfurter.dev/v1/latest?base={base}&symbols={quote}"),
+        url: format!("https://api.frankfurter.dev/v1/latest?base={base}"),
         headers: Vec::new(),
         body: Vec::new(),
     };
@@ -112,16 +150,16 @@ fn rate(base: &str, quote: &str) -> Result<f64, String> {
     }
     let parsed: LatestRates = serde_json::from_slice(&response.body)
         .map_err(|_| "Currency service returned invalid data.".to_owned())?;
-    let rate = parsed
-        .rates
-        .get(quote)
-        .copied()
-        .ok_or_else(|| "Currency service did not return the requested rate.".to_owned())
-        .and_then(valid_rate)?;
-    if let Ok(bytes) = serde_json::to_vec(&Rate { rate }) {
-        let _ = host::cache_put(&key, &bytes);
+    if parsed.rates.is_empty()
+        || parsed
+            .rates
+            .values()
+            .copied()
+            .any(|rate| valid_rate(rate).is_err())
+    {
+        return Err("Currency service returned invalid rates.".into());
     }
-    Ok(rate)
+    Ok(parsed.rates)
 }
 fn valid_rate(rate: f64) -> Result<f64, String> {
     (rate.is_finite() && rate > 0.0)
@@ -170,5 +208,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.rates.get("USD"), Some(&0.19537));
+    }
+
+    #[test]
+    fn currency_cache_expires_without_underflowing_future_timestamps() {
+        assert!(cache_is_fresh(100, 100 + RATE_CACHE_TTL_SECONDS));
+        assert!(!cache_is_fresh(100, 101 + RATE_CACHE_TTL_SECONDS));
+        assert!(!cache_is_fresh(0, 1));
+        assert!(cache_is_fresh(200, 100));
+    }
+
+    #[test]
+    fn per_base_cache_serves_multiple_quotes() {
+        let cached = CachedRates {
+            rates: BTreeMap::from([("EUR".into(), 0.9), ("BRL".into(), 5.4)]),
+            fetched_at: 100,
+        };
+        let encoded = serde_json::to_vec(&cached).unwrap();
+        let decoded: CachedRates = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.rates.get("EUR"), Some(&0.9));
+        assert_eq!(decoded.rates.get("BRL"), Some(&5.4));
     }
 }
