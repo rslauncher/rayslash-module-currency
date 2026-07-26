@@ -61,12 +61,28 @@ impl Guest for Component {
 
 fn parse(input: &str) -> Option<(f64, String, String)> {
     let words = input.split_whitespace().collect::<Vec<_>>();
-    if words.len() != 4 || !words[2].eq_ignore_ascii_case("to") {
-        return None;
-    }
-    let amount = words[0].replace(',', "").parse::<f64>().ok()?;
-    let base = code(words[1])?;
-    let quote = code(words[3])?;
+    let (amount, base, quote) = match words.as_slice() {
+        [amount, base, separator, quote] if separator.eq_ignore_ascii_case("to") => (
+            amount.replace(',', "").parse::<f64>().ok()?,
+            code(base)?,
+            code(quote)?,
+        ),
+        [amount_and_base, separator, quote] if separator.eq_ignore_ascii_case("to") => {
+            let split = amount_and_base
+                .char_indices()
+                .rev()
+                .take_while(|(_, character)| character.is_ascii_alphabetic())
+                .last()
+                .map(|(index, _)| index)?;
+            let (amount, base) = amount_and_base.split_at(split);
+            (
+                amount.replace(',', "").parse::<f64>().ok()?,
+                code(base)?,
+                code(quote)?,
+            )
+        }
+        _ => return None,
+    };
     amount.is_finite().then_some((amount, base, quote))
 }
 fn code(value: &str) -> Option<String> {
@@ -133,6 +149,14 @@ mod tests {
         assert_eq!(
             parse("25 brl to usd"),
             Some((25.0, "BRL".into(), "USD".into()))
+        );
+        assert_eq!(
+            parse("10usd to brl"),
+            Some((10.0, "USD".into(), "BRL".into()))
+        );
+        assert_eq!(
+            parse("1,250.50EUR to USD"),
+            Some((1250.5, "EUR".into(), "USD".into()))
         );
     }
     #[test]
