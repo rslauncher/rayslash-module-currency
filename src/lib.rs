@@ -22,8 +22,10 @@ struct CachedRates {
 }
 
 #[derive(Deserialize)]
-struct LatestRates {
-    rates: BTreeMap<String, f64>,
+struct LatestRate {
+    base: String,
+    quote: String,
+    rate: f64,
 }
 
 impl Guest for Component {
@@ -39,21 +41,32 @@ impl Guest for Component {
         } else {
             rate(&base, &quote).map(|rate| amount * rate)
         };
-        let (title, action) = match result {
+        let (title, subtitle, action) = match result {
             Ok(value) => {
                 let text = format!("{} {quote}", format_number(value));
-                (text.clone(), Action::CopyText(text))
+                (
+                    text.clone(),
+                    format!(
+                        "Convert {} {base} to {quote} with Frankfurter",
+                        format_number(amount)
+                    ),
+                    Action::CopyText(text),
+                )
             }
-            Err(error) => (error.clone(), Action::ShowMessage(error)),
+            Err(message) => {
+                let subtitle = format!("{base} to {quote}. {message}");
+                (
+                    "Currency rate unavailable".to_owned(),
+                    subtitle.clone(),
+                    Action::ShowMessage(subtitle),
+                )
+            }
         };
         Ok(QueryResponse {
             results: vec![ResultItem {
                 id: format!("currency:{}:{base}:{quote}", format_number(amount)),
                 title,
-                subtitle: format!(
-                    "Convert {} {base} to {quote} with Frankfurter",
-                    format_number(amount)
-                ),
+                subtitle,
                 icon: Icon::PackagePath("icon.svg".into()),
                 score: None,
                 action,
@@ -93,26 +106,28 @@ fn code(value: &str) -> Option<String> {
     let value = value.to_ascii_uppercase();
     (value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())).then_some(value)
 }
-fn rate(base: &str, quote: &str) -> Result<f64, String> {
+fn rate(base: &str, quote: &str) -> Result<f64, &'static str> {
     let key = format!("rates-v2-{base}.json");
     let now = host::unix_time();
     let cached = host::cache_get(&key)
         .ok()
         .flatten()
         .and_then(|bytes| serde_json::from_slice::<CachedRates>(&bytes).ok());
-    if let Some(rates) = cached.as_ref()
-        && cache_is_fresh(rates.fetched_at, now)
-        && let Some(rate) = rates.rates.get(quote).copied()
+    let cached_rate = cached
+        .as_ref()
+        .and_then(|table| table.rates.get(quote).copied())
+        .filter(|&rate| is_valid_rate(rate));
+    if let Some(rate) = cached_rate
+        && cached.is_some_and(|table| cache_is_fresh(table.fetched_at, now))
     {
-        return valid_rate(rate);
+        return Ok(rate);
     }
     match request_rates(base) {
         Ok(rates) => {
             let rate = rates
                 .get(quote)
                 .copied()
-                .ok_or_else(|| "Currency service did not return the requested rate.".to_owned())
-                .and_then(valid_rate)?;
+                .ok_or("Frankfurter has no rate for this pair.")?;
             if let Ok(bytes) = serde_json::to_vec(&CachedRates {
                 rates,
                 fetched_at: now,
@@ -121,11 +136,7 @@ fn rate(base: &str, quote: &str) -> Result<f64, String> {
             }
             Ok(rate)
         }
-        Err(error) => cached
-            .and_then(|rates| rates.rates.get(quote).copied())
-            .map(valid_rate)
-            .transpose()
-            .and_then(|rate| rate.ok_or(error)),
+        Err(error) => cached_rate.ok_or(error),
     }
 }
 
@@ -133,38 +144,41 @@ fn cache_is_fresh(fetched_at: u64, now: u64) -> bool {
     fetched_at != 0 && now.saturating_sub(fetched_at) <= RATE_CACHE_TTL_SECONDS
 }
 
-fn request_rates(base: &str) -> Result<BTreeMap<String, f64>, String> {
+fn request_rates(base: &str) -> Result<BTreeMap<String, f64>, &'static str> {
     let request = host::HttpRequest {
         method: "GET".into(),
-        url: format!("https://api.frankfurter.dev/v1/latest?base={base}"),
+        url: format!("https://api.frankfurter.dev/v2/rates?base={base}"),
         headers: Vec::new(),
         body: Vec::new(),
     };
-    let response =
-        host::request(&request).map_err(|error| format!("Currency rate unavailable: {error:?}"))?;
+    let unavailable = "Check the currency codes or try again later.";
+    let response = host::request(&request).map_err(|_| unavailable)?;
     if response.status != 200 {
-        return Err(format!(
-            "Currency service returned HTTP {}.",
-            response.status
-        ));
+        return Err(unavailable);
     }
-    let parsed: LatestRates = serde_json::from_slice(&response.body)
-        .map_err(|_| "Currency service returned invalid data.".to_owned())?;
-    if parsed.rates.is_empty()
-        || parsed
-            .rates
-            .values()
-            .copied()
-            .any(|rate| valid_rate(rate).is_err())
-    {
-        return Err("Currency service returned invalid rates.".into());
-    }
-    Ok(parsed.rates)
+    parse_latest_rates(&response.body, base)
 }
-fn valid_rate(rate: f64) -> Result<f64, String> {
-    (rate.is_finite() && rate > 0.0)
-        .then_some(rate)
-        .ok_or_else(|| "Currency service returned an invalid rate.".into())
+
+fn parse_latest_rates(body: &[u8], base: &str) -> Result<BTreeMap<String, f64>, &'static str> {
+    const INVALID_RATES: &str = "Frankfurter returned invalid rates. Try again later.";
+
+    let entries: Vec<LatestRate> = serde_json::from_slice(body).map_err(|_| INVALID_RATES)?;
+    if entries.is_empty() {
+        return Err("Frankfurter returned no rates. Check the currency codes.");
+    }
+    let mut rates = BTreeMap::new();
+    for entry in entries {
+        if entry.base != base
+            || !is_valid_rate(entry.rate)
+            || rates.insert(entry.quote, entry.rate).is_some()
+        {
+            return Err(INVALID_RATES);
+        }
+    }
+    Ok(rates)
+}
+fn is_valid_rate(rate: f64) -> bool {
+    rate.is_finite() && rate > 0.0
 }
 fn format_number(value: f64) -> String {
     if (value - value.round()).abs() < 1e-10 {
@@ -202,12 +216,30 @@ mod tests {
         assert!(parse("25 dollars to usd").is_none());
     }
     #[test]
-    fn parses_current_frankfurter_response() {
-        let response: LatestRates = serde_json::from_str(
-            r#"{"amount":1.0,"base":"BRL","date":"2026-07-10","rates":{"USD":0.19537}}"#,
+    fn parses_argentine_peso_rates_from_frankfurter_v2() {
+        let rates = parse_latest_rates(
+            br#"[
+                {"date":"2026-11-20","base":"ARS","quote":"BRL","rate":0.003775},
+                {"date":"2026-11-20","base":"ARS","quote":"USD","rate":0.0006398}
+            ]"#,
+            "ARS",
         )
         .unwrap();
-        assert_eq!(response.rates.get("USD"), Some(&0.19537));
+        assert_eq!(format_number(7400.0 * rates["BRL"]), "27.935");
+        assert_eq!(rates["USD"], 0.0006398);
+    }
+
+    #[test]
+    fn rejects_wrong_base_invalid_rates_and_ambiguous_quotes() {
+        for response in [
+            r#"{"amount":1.0,"base":"ARS","rates":{"BRL":0.003775}}"#,
+            r#"[]"#,
+            r#"[{"base":"USD","quote":"BRL","rate":5.4}]"#,
+            r#"[{"base":"ARS","quote":"BRL","rate":0}]"#,
+            r#"[{"base":"ARS","quote":"BRL","rate":0.003775},{"base":"ARS","quote":"BRL","rate":0.004}]"#,
+        ] {
+            assert!(parse_latest_rates(response.as_bytes(), "ARS").is_err());
+        }
     }
 
     #[test]
