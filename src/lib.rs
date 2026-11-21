@@ -43,7 +43,7 @@ impl Guest for Component {
         };
         let (title, subtitle, action) = match result {
             Ok(value) => {
-                let text = format!("{} {quote}", format_number(value));
+                let text = format!("{} {quote}", format_currency_amount(value));
                 (
                     text.clone(),
                     format!(
@@ -180,6 +180,16 @@ fn parse_latest_rates(body: &[u8], base: &str) -> Result<BTreeMap<String, f64>, 
 fn is_valid_rate(rate: f64) -> bool {
     rate.is_finite() && rate > 0.0
 }
+
+fn format_currency_amount(value: f64) -> String {
+    let formatted = format!("{value:.2}");
+    if formatted == "-0.00" {
+        "0.00".into()
+    } else {
+        formatted
+    }
+}
+
 fn format_number(value: f64) -> String {
     if (value - value.round()).abs() < 1e-10 {
         format!("{value:.0}")
@@ -225,8 +235,16 @@ mod tests {
             "ARS",
         )
         .unwrap();
-        assert_eq!(format_number(7400.0 * rates["BRL"]), "27.935");
+        assert_eq!(format_currency_amount(7400.0 * rates["BRL"]), "27.94");
         assert_eq!(rates["USD"], 0.0006398);
+    }
+
+    #[test]
+    fn currency_results_keep_two_decimal_places() {
+        assert_eq!(format_currency_amount(12.0), "12.00");
+        assert_eq!(format_currency_amount(5.4), "5.40");
+        assert_eq!(format_currency_amount(-5.436), "-5.44");
+        assert_eq!(format_currency_amount(-0.001), "0.00");
     }
 
     #[test]
